@@ -46,6 +46,10 @@ struct BlobInfo {
     digest: String,
     size: u64,
     extracted_size: u64,
+    duration_ms: u64,
+    pulled_at: String,
+    expires_at: String,
+    ttl_hours: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -152,20 +156,36 @@ async fn get_blobs(State(state): State<AppState>) -> Json<Vec<BlobInfo>> {
     if let Ok(entries) = std::fs::read_dir(&blobs_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with("-extracted") {
+            if name.ends_with("-extracted") || name.ends_with("-meta.json") {
                 continue;
             }
+
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let extracted_size = dir_size(&blobs_dir.join(format!("{}-extracted", name)));
+
+            // Lit le meta si disponible
+            let meta = read_blob_meta(&blobs_dir.join(format!("{}-meta.json", name)));
+
             blobs.push(BlobInfo {
                 digest: name,
                 size,
                 extracted_size,
+                duration_ms: meta["duration_ms"].as_u64().unwrap_or(0),
+                pulled_at: meta["pulled_at"].as_str().unwrap_or("").to_string(),
+                expires_at: meta["expires_at"].as_str().unwrap_or("").to_string(),
+                ttl_hours: meta["ttl_hours"].as_u64().unwrap_or(0),
             });
         }
     }
 
     Json(blobs)
+}
+
+fn read_blob_meta(path: &PathBuf) -> serde_json::Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
 
 async fn pull_image(
