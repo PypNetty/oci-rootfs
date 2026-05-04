@@ -29,7 +29,14 @@ struct PullStatus {
 #[derive(Debug, Serialize)]
 struct VmInfo {
     name: String,
+    image: String,
     layers: Vec<String>,
+    layers_downloaded: u32,
+    layers_cached: u32,
+    bytes_downloaded: u64,
+    bytes_total: u64,
+    pull_duration_ms: u64,
+    pulled_at: String,
     socket_active: bool,
     upper_size: u64,
 }
@@ -87,9 +94,9 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/vms",   get(get_vms))
+        .route("/api/vms", get(get_vms))
         .route("/api/blobs", get(get_blobs))
-        .route("/api/pull",  post(pull_image))
+        .route("/api/pull", post(pull_image))
         .route("/api/pulls", get(get_pulls))
         .nest_service("/", ServeDir::new("frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
@@ -109,11 +116,29 @@ async fn get_vms(State(state): State<AppState>) -> Json<Vec<VmInfo>> {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             let vm_path = entry.path();
-            let layers = read_layers(&state.store_root, &vm_path);
+            let info = read_vm_info(&vm_path).unwrap_or_default();
             let socket = vm_path.with_extension("sock");
-            let socket_active = socket.exists();
-            let upper_size = dir_size(&vm_path.join("upper"));
-            vms.push(VmInfo { name, layers, socket_active, upper_size });
+
+            vms.push(VmInfo {
+                name,
+                image: info["image"].as_str().unwrap_or("unknown").to_string(),
+                layers: info["layers"]
+                    .as_array()
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|v| v.as_str().map(|s| s[..12.min(s.len())].to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                layers_downloaded: info["layers_downloaded"].as_u64().unwrap_or(0) as u32,
+                layers_cached: info["layers_cached"].as_u64().unwrap_or(0) as u32,
+                bytes_downloaded: info["bytes_downloaded"].as_u64().unwrap_or(0),
+                bytes_total: info["bytes_total"].as_u64().unwrap_or(0),
+                pull_duration_ms: info["pull_duration_ms"].as_u64().unwrap_or(0),
+                pulled_at: info["pulled_at"].as_str().unwrap_or("").to_string(),
+                socket_active: socket.exists(),
+                upper_size: dir_size(&vm_path.join("upper")),
+            });
         }
     }
 
@@ -127,10 +152,16 @@ async fn get_blobs(State(state): State<AppState>) -> Json<Vec<BlobInfo>> {
     if let Ok(entries) = std::fs::read_dir(&blobs_dir) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.ends_with("-extracted") { continue; }
+            if name.ends_with("-extracted") {
+                continue;
+            }
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let extracted_size = dir_size(&blobs_dir.join(format!("{}-extracted", name)));
-            blobs.push(BlobInfo { digest: name, size, extracted_size });
+            blobs.push(BlobInfo {
+                digest: name,
+                size,
+                extracted_size,
+            });
         }
     }
 
@@ -146,11 +177,14 @@ async fn pull_image(
 
     {
         let mut pulls = state.pulls.lock().await;
-        pulls.insert(name.clone(), PullStatus {
-            name: name.clone(),
-            status: "pulling".to_string(),
-            error: None,
-        });
+        pulls.insert(
+            name.clone(),
+            PullStatus {
+                name: name.clone(),
+                status: "pulling".to_string(),
+                error: None,
+            },
+        );
     }
 
     let pulls = state.pulls.clone();
@@ -163,12 +197,26 @@ async fn pull_image(
 
         let mut pulls = pulls.lock().await;
         match result {
-            Ok(_) => { pulls.insert(name.clone(), PullStatus {
-                name, status: "ready".to_string(), error: None,
-            }); }
-            Err(e) => { pulls.insert(name.clone(), PullStatus {
-                name, status: "error".to_string(), error: Some(e.to_string()),
-            }); }
+            Ok(_) => {
+                pulls.insert(
+                    name.clone(),
+                    PullStatus {
+                        name,
+                        status: "ready".to_string(),
+                        error: None,
+                    },
+                );
+            }
+            Err(e) => {
+                pulls.insert(
+                    name.clone(),
+                    PullStatus {
+                        name,
+                        status: "error".to_string(),
+                        error: Some(e.to_string()),
+                    },
+                );
+            }
         }
     });
 
@@ -190,16 +238,8 @@ fn dir_size(path: &PathBuf) -> u64 {
         .sum()
 }
 
-fn read_layers(_store_root: &PathBuf, vm_path: &PathBuf) -> Vec<String> {
+fn read_vm_info(vm_path: &PathBuf) -> Option<serde_json::Value> {
     let manifest = vm_path.join("manifest.json");
-    if let Ok(content) = std::fs::read_to_string(&manifest) {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
-            if let Some(layers) = json["layers"].as_array() {
-                return layers.iter()
-                    .filter_map(|l| l.as_str().map(|s| s[..12].to_string()))
-                    .collect();
-            }
-        }
-    }
-    vec![]
+    let content = std::fs::read_to_string(&manifest).ok()?;
+    serde_json::from_str(&content).ok()
 }
