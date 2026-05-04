@@ -36,26 +36,37 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     archive.set_preserve_mtime(true);
     archive.set_overwrite(true);
     archive.set_unpack_xattrs(false);
+    archive.set_preserve_ownerships(false);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
-        let path = entry.path()?;
+        let path = entry.path()?.into_owned();
 
         if path.is_absolute() {
             continue;
         }
 
+        let mut skip = false;
         for component in path.components() {
-            match component {
-                std::path::Component::ParentDir => continue,
-                std::path::Component::Normal(_) => {}
-                _ => continue,
+            if let std::path::Component::ParentDir = component {
+                skip = true;
+                break;
             }
+        }
+        if skip {
+            continue;
         }
 
         let target = dest.join(&path);
         if !target.starts_with(dest) {
             tracing::warn!("path traversal detected, skipping: {:?}", path);
+            continue;
+        }
+
+        if entry.header().entry_type().is_hard_link() {
+            if let Err(e) = entry.unpack(&target) {
+                tracing::debug!("hard link skipped: {:?} — {}", path, e);
+            }
             continue;
         }
 
