@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 use thiserror::Error;
 
-use image::unpack::{UnpackError, extract_layer, save_blob, verify_digest};
+use image::unpack::{UnpackError, extract_layer, save_blob, save_blob_meta, verify_digest};
 use overlay::fuse::{OverlayError, OverlayMount, mount_overlay, spawn_virtiofsd};
 use registry::{
     auth::Credentials,
@@ -18,7 +18,7 @@ use registry::{
 };
 use store::{Store, StoreError};
 
-const MAX_ROOTFS_SIZE: u64 = 300 * 1024 * 1024; // 300 Mo
+const MAX_ROOTFS_SIZE: u64 = 300 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum OciError {
@@ -47,6 +47,7 @@ pub struct RootfsBuilder {
     arch: Arch,
     name: String,
     credentials: Option<Credentials>,
+    ttl_h: u64,
 }
 
 impl Default for RootfsBuilder {
@@ -56,6 +57,7 @@ impl Default for RootfsBuilder {
             arch: Arch::Amd64,
             name: String::new(),
             credentials: None,
+            ttl_h: 24,
         }
     }
 }
@@ -85,28 +87,28 @@ impl RootfsBuilder {
         self
     }
 
+    pub fn ttl_hours(mut self, hours: u64) -> Self {
+        self.ttl_h = hours;
+        self
+    }
+
     pub async fn build(self) -> Result<Rootfs, OciError> {
-        // 1. Parse image ref → registry / repository / tag
         let (registry, repository, tag) = parse_image_ref(&self.image)?;
 
-        // 2. Init store
         let store = Store::new()?;
         let vm_dir = store.vm_dir(&self.name);
         vm_dir.create()?;
 
-        // 3. Pull manifest
         let client = RegistryClient::new(self.credentials);
         let manifest = client
             .pull_manifest(&registry, &repository, &tag, &self.arch)
             .await?;
 
-        // Vérifie la taille totale déclarée
         let bytes_total: u64 = manifest.layers.iter().map(|l| l.size).sum();
         if bytes_total > MAX_ROOTFS_SIZE {
             return Err(OciError::RootfsTooLarge(bytes_total));
         }
 
-        // 4. Pull + cache chaque layer
         let pull_start = Instant::now();
         let mut lower_dirs: Vec<PathBuf> = Vec::new();
         let mut bytes_downloaded: u64 = 0;
@@ -119,18 +121,28 @@ impl RootfsBuilder {
             let layer_dir = store.blob_path(&format!("{}-extracted", digest));
 
             if !layer_dir.exists() {
-                tracing::info!("pulling layer {}", &digest[..12]);
+                let layer_start = Instant::now();
 
                 let data = client
                     .pull_blob(&registry, &repository, &layer.digest)
                     .await?;
 
+                let layer_duration_ms = layer_start.elapsed().as_millis() as u64;
                 bytes_downloaded += data.len() as u64;
                 layers_downloaded += 1;
 
                 verify_digest(&data, &layer.digest)?;
                 save_blob(&data, &blob_path)?;
                 extract_layer(&data, &layer_dir)?;
+
+                let meta_path = store.blob_path(&format!("{}-meta.json", digest));
+                save_blob_meta(
+                    digest,
+                    data.len() as u64,
+                    layer_duration_ms,
+                    self.ttl_h,
+                    &meta_path,
+                )?;
             } else {
                 tracing::info!("layer {} cached", &digest[..12]);
                 layers_cached += 1;
@@ -141,7 +153,6 @@ impl RootfsBuilder {
 
         let pull_duration_ms = pull_start.elapsed().as_millis() as u64;
 
-        // Sauvegarde manifest.json
         let meta = serde_json::json!({
             "image": self.image,
             "pulled_at": chrono::Utc::now().to_rfc3339(),
@@ -160,7 +171,6 @@ impl RootfsBuilder {
         std::fs::write(vm_dir.base.join("manifest.json"), meta.to_string())
             .map_err(StoreError::Io)?;
 
-        // 5. Mount overlay
         let lower_refs: Vec<&std::path::Path> =
             lower_dirs.iter().map(|p| p.as_path()).collect();
 
@@ -171,7 +181,6 @@ impl RootfsBuilder {
             &vm_dir.merged(),
         )?;
 
-        // 6. Spawn virtiofsd
         let socket = vm_dir.merged().with_extension("sock");
         let _vhost = spawn_virtiofsd(&socket, &vm_dir.merged())?;
 
