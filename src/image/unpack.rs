@@ -1,5 +1,6 @@
 // src/image/unpack.rs
 
+use chrono;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -13,22 +14,18 @@ pub enum UnpackError {
     DigestMismatch { expected: String, got: String },
 }
 
-/// Vérifie le digest SHA256 d'un blob avant de l'extraire
 pub fn verify_digest(data: &[u8], expected: &str) -> Result<(), UnpackError> {
     let expected = expected.trim_start_matches("sha256:");
     let got = hex::encode(Sha256::digest(data));
-
     if got != expected {
         return Err(UnpackError::DigestMismatch {
             expected: expected.to_string(),
             got,
         });
     }
-
     Ok(())
 }
 
-/// Extrait un layer tar.gz dans un dossier destination
 pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     std::fs::create_dir_all(dest)?;
 
@@ -44,12 +41,10 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
         let mut entry = entry?;
         let path = entry.path()?;
 
-        // Rejette les chemins absolus
         if path.is_absolute() {
             continue;
         }
 
-        // Rejette les path traversal
         for component in path.components() {
             match component {
                 std::path::Component::ParentDir => continue,
@@ -58,7 +53,6 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
             }
         }
 
-        // Vérifie que le chemin résolu reste dans dest
         let target = dest.join(&path);
         if !target.starts_with(dest) {
             tracing::warn!("path traversal detected, skipping: {:?}", path);
@@ -71,11 +65,36 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     Ok(())
 }
 
-/// Sauvegarde un blob brut dans le cache store
 pub fn save_blob(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::write(dest, data)?;
+    Ok(())
+}
+
+pub fn save_blob_meta(
+    digest: &str,
+    size: u64,
+    duration_ms: u64,
+    ttl_hours: u64,
+    dest: &Path,
+) -> Result<(), UnpackError> {
+    let now = chrono::Utc::now();
+    let expires_at = now + chrono::Duration::hours(ttl_hours as i64);
+
+    let meta = serde_json::json!({
+        "digest": digest,
+        "size": size,
+        "duration_ms": duration_ms,
+        "pulled_at": now.to_rfc3339(),
+        "expires_at": expires_at.to_rfc3339(),
+        "ttl_hours": ttl_hours,
+    });
+
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(dest, meta.to_string())?;
     Ok(())
 }
