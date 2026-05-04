@@ -4,7 +4,7 @@ use axum::{
     http::{Method, StatusCode},
     middleware::{self, Next},
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
@@ -94,14 +94,16 @@ async fn main() {
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/vms", get(get_vms))
-        .route("/api/blobs", get(get_blobs))
-        .route("/api/pull", post(pull_image))
-        .route("/api/pulls", get(get_pulls))
+        .route("/api/vms",           get(get_vms))
+        .route("/api/vms/:name",     delete(delete_vm))
+        .route("/api/blobs",         get(get_blobs))
+        .route("/api/blobs/:digest", delete(delete_blob))
+        .route("/api/pull",          post(pull_image))
+        .route("/api/pulls",         get(get_pulls))
         .nest_service("/", ServeDir::new("frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors)
@@ -128,11 +130,9 @@ async fn get_vms(State(state): State<AppState>) -> Json<Vec<VmInfo>> {
                 image: info["image"].as_str().unwrap_or("unknown").to_string(),
                 layers: info["layers"]
                     .as_array()
-                    .map(|l| {
-                        l.iter()
-                            .filter_map(|v| v.as_str().map(|s| s[..12.min(s.len())].to_string()))
-                            .collect()
-                    })
+                    .map(|l| l.iter()
+                        .filter_map(|v| v.as_str().map(|s| s[..12.min(s.len())].to_string()))
+                        .collect())
                     .unwrap_or_default(),
                 layers_downloaded: info["layers_downloaded"].as_u64().unwrap_or(0) as u32,
                 layers_cached: info["layers_cached"].as_u64().unwrap_or(0) as u32,
@@ -162,8 +162,6 @@ async fn get_blobs(State(state): State<AppState>) -> Json<Vec<BlobInfo>> {
 
             let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
             let extracted_size = dir_size(&blobs_dir.join(format!("{}-extracted", name)));
-
-            // Lit le meta si disponible
             let meta = read_blob_meta(&blobs_dir.join(format!("{}-meta.json", name)));
 
             blobs.push(BlobInfo {
@@ -181,13 +179,6 @@ async fn get_blobs(State(state): State<AppState>) -> Json<Vec<BlobInfo>> {
     Json(blobs)
 }
 
-fn read_blob_meta(path: &PathBuf) -> serde_json::Value {
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|c| serde_json::from_str(&c).ok())
-        .unwrap_or(serde_json::Value::Null)
-}
-
 async fn pull_image(
     State(state): State<AppState>,
     Json(req): Json<PullRequest>,
@@ -197,14 +188,11 @@ async fn pull_image(
 
     {
         let mut pulls = state.pulls.lock().await;
-        pulls.insert(
-            name.clone(),
-            PullStatus {
-                name: name.clone(),
-                status: "pulling".to_string(),
-                error: None,
-            },
-        );
+        pulls.insert(name.clone(), PullStatus {
+            name: name.clone(),
+            status: "pulling".to_string(),
+            error: None,
+        });
     }
 
     let pulls = state.pulls.clone();
@@ -217,26 +205,12 @@ async fn pull_image(
 
         let mut pulls = pulls.lock().await;
         match result {
-            Ok(_) => {
-                pulls.insert(
-                    name.clone(),
-                    PullStatus {
-                        name,
-                        status: "ready".to_string(),
-                        error: None,
-                    },
-                );
-            }
-            Err(e) => {
-                pulls.insert(
-                    name.clone(),
-                    PullStatus {
-                        name,
-                        status: "error".to_string(),
-                        error: Some(e.to_string()),
-                    },
-                );
-            }
+            Ok(_) => { pulls.insert(name.clone(), PullStatus {
+                name, status: "ready".to_string(), error: None,
+            }); }
+            Err(e) => { pulls.insert(name.clone(), PullStatus {
+                name, status: "error".to_string(), error: Some(e.to_string()),
+            }); }
         }
     });
 
@@ -246,6 +220,45 @@ async fn pull_image(
 async fn get_pulls(State(state): State<AppState>) -> Json<Vec<PullStatus>> {
     let pulls = state.pulls.lock().await;
     Json(pulls.values().cloned().collect())
+}
+
+async fn delete_vm(
+    State(state): State<AppState>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let vm_path = state.store_root.join("vms").join(&name);
+    if !vm_path.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let merged = vm_path.join("merged");
+    let _ = std::process::Command::new("fusermount3")
+        .args(["-u", merged.to_str().unwrap()])
+        .status();
+
+    std::fs::remove_dir_all(&vm_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(serde_json::json!({ "deleted": name })))
+}
+
+async fn delete_blob(
+    State(state): State<AppState>,
+    axum::extract::Path(digest): axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, StatusCode> {
+    let blobs_dir = state.store_root.join("blobs/sha256");
+    let blob = blobs_dir.join(&digest);
+    let extracted = blobs_dir.join(format!("{}-extracted", digest));
+    let meta = blobs_dir.join(format!("{}-meta.json", digest));
+
+    if !blob.exists() {
+        return Err(StatusCode::NOT_FOUND);
+    }
+
+    let _ = std::fs::remove_file(&blob);
+    let _ = std::fs::remove_dir_all(&extracted);
+    let _ = std::fs::remove_file(&meta);
+
+    Ok(Json(serde_json::json!({ "deleted": digest })))
 }
 
 fn dir_size(path: &PathBuf) -> u64 {
@@ -262,4 +275,11 @@ fn read_vm_info(vm_path: &PathBuf) -> Option<serde_json::Value> {
     let manifest = vm_path.join("manifest.json");
     let content = std::fs::read_to_string(&manifest).ok()?;
     serde_json::from_str(&content).ok()
+}
+
+fn read_blob_meta(path: &PathBuf) -> serde_json::Value {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|c| serde_json::from_str(&c).ok())
+        .unwrap_or(serde_json::Value::Null)
 }
