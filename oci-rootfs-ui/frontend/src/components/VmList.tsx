@@ -1,4 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import axios from "axios";
 
 interface VmInfo {
@@ -40,10 +40,16 @@ function formatDate(iso: string) {
 }
 
 export function VmList() {
+  const qc = useQueryClient();
   const { data: vms = [], isLoading } = useQuery({
     queryKey: ["vms"],
     queryFn: () => axios.get<VmInfo[]>("/api/vms").then((r) => r.data),
   });
+
+  async function handleDelete(name: string) {
+    await axios.delete(`/api/vms/${name}`);
+    qc.invalidateQueries({ queryKey: ["vms"] });
+  }
 
   return (
     <section style={{ marginBottom: "2rem" }}>
@@ -105,7 +111,7 @@ export function VmList() {
                 {vm.image}
               </span>
             </div>
-            <div style={{ display: "flex", gap: 6 }}>
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
               {vm.socket_active && (
                 <span
                   style={{
@@ -120,6 +126,21 @@ export function VmList() {
                   virtiofsd up
                 </span>
               )}
+              <button
+                onClick={() => handleDelete(vm.name)}
+                style={{
+                  fontSize: 11,
+                  padding: "3px 10px",
+                  borderRadius: 6,
+                  border: "0.5px solid #f5c6c6",
+                  background: "#fff5f5",
+                  color: "#c00",
+                  cursor: "pointer",
+                  fontWeight: 500,
+                }}
+              >
+                supprimer
+              </button>
             </div>
           </div>
 
@@ -219,6 +240,7 @@ export function VmList() {
           <div style={{ fontSize: 11, color: "#aaa", marginBottom: 8 }}>
             {vm.layers_downloaded} téléchargés · {vm.layers_cached} en cache
           </div>
+
           {/* Footer */}
           <div style={{ fontSize: 11, color: "#bbb" }}>
             pullé le {formatDate(vm.pulled_at)}
