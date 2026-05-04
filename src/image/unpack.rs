@@ -1,8 +1,8 @@
 // src/image/unpack.rs
 
-use std::path::Path;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use std::path::Path;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -35,12 +35,38 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     let gz = GzDecoder::new(data);
     let mut archive = tar::Archive::new(gz);
 
-    // preserve_permissions + preserve_mtime pour un rootfs fidèle
     archive.set_preserve_permissions(true);
     archive.set_preserve_mtime(true);
     archive.set_overwrite(true);
+    archive.set_unpack_xattrs(false);
 
-    archive.unpack(dest)?;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?;
+
+        // Rejette les chemins absolus
+        if path.is_absolute() {
+            continue;
+        }
+
+        // Rejette les path traversal
+        for component in path.components() {
+            match component {
+                std::path::Component::ParentDir => continue,
+                std::path::Component::Normal(_) => {}
+                _ => continue,
+            }
+        }
+
+        // Vérifie que le chemin résolu reste dans dest
+        let target = dest.join(&path);
+        if !target.starts_with(dest) {
+            tracing::warn!("path traversal detected, skipping: {:?}", path);
+            continue;
+        }
+
+        entry.unpack(&target)?;
+    }
 
     Ok(())
 }
