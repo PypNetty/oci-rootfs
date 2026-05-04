@@ -47,7 +47,7 @@ export function VmList() {
   });
 
   async function handleDelete(name: string) {
-    await axios.delete(`/api/vms/${name}`);
+    await axios.delete(`http://localhost:3000/api/vms/${name}`)
     qc.invalidateQueries({ queryKey: ["vms"] });
   }
 

@@ -101,13 +101,14 @@ async fn main() {
         .route("/api/vms", get(get_vms))
         .route("/api/vms/:name", delete(delete_vm))
         .route("/api/blobs", get(get_blobs))
-        .route("/api/blobs/{digest}", delete(delete_blob))
+        .route("/api/blobs/:digest", delete(delete_blob))
         .route("/api/pull", post(pull_image))
+        .route("/api/test-delete", delete(|| async { "ok" }))
         .route("/api/pulls", get(get_pulls))
-        .nest_service("/", ServeDir::new("frontend/dist"))
+        .with_state(state)
+        .fallback_service(ServeDir::new("frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
-        .layer(cors)
-        .with_state(state);
+        .layer(cors);
 
     println!("oci-rootfs-ui → http://localhost:3000");
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
@@ -262,15 +263,18 @@ async fn delete_vm(
 
 async fn delete_blob(
     State(state): State<AppState>,
-    axum::extract::Path(digest): axum::extract::Path<String>,
-) -> Result<Json<serde_json::Value>, StatusCode> {
+    digest: axum::extract::Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    // Strip sha256: prefix if present
+    let digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
+
     let blobs_dir = state.store_root.join("blobs/sha256");
-    let blob = blobs_dir.join(&digest);
+    let blob = blobs_dir.join(digest);
     let extracted = blobs_dir.join(format!("{}-extracted", digest));
     let meta = blobs_dir.join(format!("{}-meta.json", digest));
 
     if !blob.exists() {
-        return Err(StatusCode::NOT_FOUND);
+        return Err((StatusCode::NOT_FOUND, format!("blob not found: {}", digest)));
     }
 
     let _ = std::fs::remove_file(&blob);

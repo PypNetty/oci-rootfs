@@ -69,7 +69,7 @@ export function BlobCache() {
   });
 
   async function handleDelete(digest: string) {
-    await axios.delete(`/api/blobs/${digest}`);
+    await axios.delete(`/api/blobs/${encodeURIComponent(digest)}`);
     qc.invalidateQueries({ queryKey: ["blobs"] });
   }
 
