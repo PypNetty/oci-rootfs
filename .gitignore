@@ -1,1 +1,3 @@
-/target
+target/
+oci-rootfs-ui/frontend/node_modules/
+oci-rootfs-ui/frontend/dist/

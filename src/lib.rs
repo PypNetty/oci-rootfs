@@ -1,14 +1,243 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+// src/lib.rs
+
+pub mod image;
+pub mod overlay;
+pub mod registry;
+pub mod store;
+
+use std::path::PathBuf;
+use thiserror::Error;
+
+use image::unpack::{UnpackError, extract_layer, save_blob, verify_digest};
+use overlay::fuse::{OverlayError, OverlayMount, mount_overlay, spawn_virtiofsd};
+use registry::{
+    auth::Credentials,
+    client::{ClientError, RegistryClient},
+    manifest::Arch,
+};
+use store::{Store, StoreError};
+
+#[derive(Debug, Error)]
+pub enum OciError {
+    #[error("store error: {0}")]
+    Store(#[from] StoreError),
+    #[error("client error: {0}")]
+    Client(#[from] ClientError),
+    #[error("unpack error: {0}")]
+    Unpack(#[from] UnpackError),
+    #[error("overlay error: {0}")]
+    Overlay(#[from] OverlayError),
+    #[error("invalid image reference: {0}")]
+    InvalidRef(String),
 }
+
+/// Résultat final — ce que Muscle consomme
+pub struct Rootfs {
+    pub merged: PathBuf,
+    pub socket: PathBuf,
+    _overlay: OverlayMount,
+}
+
+pub struct RootfsBuilder {
+    image: String,
+    arch: Arch,
+    name: String,
+    credentials: Option<Credentials>,
+}
+
+impl Default for RootfsBuilder {
+    fn default() -> Self {
+        Self {
+            image: String::new(),
+            arch: Arch::Amd64,
+            name: String::new(),
+            credentials: None,
+        }
+    }
+}
+
+impl RootfsBuilder {
+    pub fn new() -> Self {
+        Self {
+            image: String::new(),
+            arch: Arch::Amd64,
+            name: String::new(),
+            credentials: None,
+        }
+    }
+
+    pub fn image(mut self, image: &str) -> Self {
+        self.image = image.to_string();
+        self
+    }
+
+    pub fn arch(mut self, arch: Arch) -> Self {
+        self.arch = arch;
+        self
+    }
+
+    pub fn name(mut self, name: &str) -> Self {
+        self.name = name.to_string();
+        self
+    }
+
+    pub fn credentials(mut self, creds: Credentials) -> Self {
+        self.credentials = Some(creds);
+        self
+    }
+
+    pub async fn build(self) -> Result<Rootfs, OciError> {
+        // 1. Parse image ref → registry / repository / tag
+        let (registry, repository, tag) = parse_image_ref(&self.image)?;
+
+        // 2. Init store
+        let store = Store::new()?;
+        let vm_dir = store.vm_dir(&self.name);
+        vm_dir.create()?;
+
+        // 3. Pull manifest
+        let client = RegistryClient::new(self.credentials);
+        let manifest = client
+            .pull_manifest(&registry, &repository, &tag, &self.arch)
+            .await?;
+
+        // 4. Pull + cache chaque layer
+        let mut lower_dirs: Vec<PathBuf> = Vec::new();
+
+        for layer in &manifest.layers {
+            let digest = layer.digest.trim_start_matches("sha256:");
+            let blob_path = store.blob_path(digest);
+            let layer_dir = store.blob_path(&format!("{}-extracted", digest));
+
+            // Skip si déjà en cache
+            if !layer_dir.exists() {
+                tracing::info!("pulling layer {}", &digest[..12]);
+
+                let data = client
+                    .pull_blob(&registry, &repository, &layer.digest)
+                    .await?;
+
+                verify_digest(&data, &layer.digest)?;
+                save_blob(&data, &blob_path)?;
+                extract_layer(&data, &layer_dir)?;
+            } else {
+                tracing::info!("layer {} cached", &digest[..12]);
+            }
+
+            lower_dirs.push(layer_dir);
+        }
+
+        // Sauvegarde manifest.json
+        let meta = serde_json::json!({
+            "image": self.image,
+            "layers": lower_dirs.iter()
+                .map(|p| p.file_name().unwrap()
+                    .to_string_lossy()
+                    .trim_end_matches("-extracted")
+                    .to_string())
+                .collect::<Vec<_>>()
+        });
+        std::fs::write(vm_dir.base.join("manifest.json"), meta.to_string())
+            .map_err(StoreError::Io)?;
+
+        // 5. Mount overlay
+        let lower_refs: Vec<&std::path::Path> = lower_dirs.iter().map(|p| p.as_path()).collect();
+
+        let overlay = mount_overlay(
+            &lower_refs,
+            &vm_dir.upper(),
+            &vm_dir.work(),
+            &vm_dir.merged(),
+        )?;
+
+        // 6. Spawn virtiofsd
+        let socket = vm_dir.merged().with_extension("sock");
+        let _vhost = spawn_virtiofsd(&socket, &vm_dir.merged())?;
+
+        Ok(Rootfs {
+            merged: vm_dir.merged(),
+            socket,
+            _overlay: overlay,
+        })
+    }
+}
+
+/// Parse "debian:trixie-slim" ou "ghcr.io/owner/repo:tag"
+fn parse_image_ref(image: &str) -> Result<(String, String, String), OciError> {
+    let (registry, rest) = if image.contains('/') {
+        let first = image.split('/').next().unwrap();
+        if first.contains('.') || first.contains(':') {
+            // registry explicite : ghcr.io/owner/repo:tag
+            let rest = &image[first.len() + 1..];
+            (first.to_string(), rest.to_string())
+        } else {
+            // Docker Hub image avec namespace : owner/repo:tag
+            ("registry-1.docker.io".to_string(), image.to_string())
+        }
+    } else {
+        // Docker Hub image officielle : debian:tag
+        (
+            "registry-1.docker.io".to_string(),
+            format!("library/{}", image),
+        )
+    };
+
+    let (repository, tag) = if let Some((r, t)) = rest.split_once(':') {
+        (r.to_string(), t.to_string())
+    } else {
+        (rest.to_string(), "latest".to_string())
+    };
+
+    Ok((registry, repository, tag))
+}
+
+// src/lib.rs — à ajouter en bas
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
+    #[tokio::test]
+    async fn test_parse_image_ref() {
+        let (registry, repository, tag) = parse_image_ref("debian:trixie-slim").unwrap();
+        assert_eq!(registry, "registry-1.docker.io");
+        assert_eq!(repository, "library/debian");
+        assert_eq!(tag, "trixie-slim");
     }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_pull_debian() {
+        let rootfs = RootfsBuilder::new()
+            .image("debian:trixie-slim")
+            .name("test-debian")
+            .build()
+            .await
+            .unwrap();
+
+        println!("merged: {:?}", rootfs.merged);
+        println!("exists: {}", rootfs.merged.exists());
+        println!("socket: {:?}", rootfs.socket);
+
+        let os_release = rootfs.merged.join("etc/os-release");
+        println!("os-release exists: {}", os_release.exists());
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_pull_multilayer() {
+        let rootfs = RootfsBuilder::new()
+            .image("node:22-slim")
+            .name("test-node")
+            .build()
+            .await
+            .unwrap();
+
+        let node_bin = rootfs.merged.join("usr/local/bin/node");
+        println!("node exists: {}", node_bin.exists());
+    }
+
+    
 }
+
+
