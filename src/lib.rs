@@ -6,6 +6,7 @@ pub mod registry;
 pub mod store;
 
 use std::path::PathBuf;
+use std::time::Instant;
 use thiserror::Error;
 
 use image::unpack::{UnpackError, extract_layer, save_blob, verify_digest};
@@ -100,13 +101,17 @@ impl RootfsBuilder {
             .await?;
 
         // Vérifie la taille totale déclarée
-        let total_size: u64 = manifest.layers.iter().map(|l| l.size).sum();
-        if total_size > MAX_ROOTFS_SIZE {
-            return Err(OciError::RootfsTooLarge(total_size));
+        let bytes_total: u64 = manifest.layers.iter().map(|l| l.size).sum();
+        if bytes_total > MAX_ROOTFS_SIZE {
+            return Err(OciError::RootfsTooLarge(bytes_total));
         }
 
         // 4. Pull + cache chaque layer
+        let pull_start = Instant::now();
         let mut lower_dirs: Vec<PathBuf> = Vec::new();
+        let mut bytes_downloaded: u64 = 0;
+        let mut layers_downloaded: u32 = 0;
+        let mut layers_cached: u32 = 0;
 
         for layer in &manifest.layers {
             let digest = layer.digest.trim_start_matches("sha256:");
@@ -120,31 +125,44 @@ impl RootfsBuilder {
                     .pull_blob(&registry, &repository, &layer.digest)
                     .await?;
 
+                bytes_downloaded += data.len() as u64;
+                layers_downloaded += 1;
+
                 verify_digest(&data, &layer.digest)?;
                 save_blob(&data, &blob_path)?;
                 extract_layer(&data, &layer_dir)?;
             } else {
                 tracing::info!("layer {} cached", &digest[..12]);
+                layers_cached += 1;
             }
 
             lower_dirs.push(layer_dir);
         }
 
+        let pull_duration_ms = pull_start.elapsed().as_millis() as u64;
+
         // Sauvegarde manifest.json
         let meta = serde_json::json!({
             "image": self.image,
+            "pulled_at": chrono::Utc::now().to_rfc3339(),
+            "pull_duration_ms": pull_duration_ms,
             "layers": lower_dirs.iter()
                 .map(|p| p.file_name().unwrap()
                     .to_string_lossy()
                     .trim_end_matches("-extracted")
                     .to_string())
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
+            "layers_downloaded": layers_downloaded,
+            "layers_cached": layers_cached,
+            "bytes_downloaded": bytes_downloaded,
+            "bytes_total": bytes_total,
         });
         std::fs::write(vm_dir.base.join("manifest.json"), meta.to_string())
             .map_err(StoreError::Io)?;
 
         // 5. Mount overlay
-        let lower_refs: Vec<&std::path::Path> = lower_dirs.iter().map(|p| p.as_path()).collect();
+        let lower_refs: Vec<&std::path::Path> =
+            lower_dirs.iter().map(|p| p.as_path()).collect();
 
         let overlay = mount_overlay(
             &lower_refs,
