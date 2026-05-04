@@ -3,6 +3,8 @@
 use reqwest::{Client, StatusCode};
 use thiserror::Error;
 
+const MAX_LAYER_SIZE: u64 = 100 * 1024 * 1024; // 100 Mo
+
 use crate::registry::auth::{self, AuthError, Credentials};
 use crate::registry::manifest::{Arch, ImageIndex, ImageManifest};
 
@@ -14,6 +16,8 @@ pub enum ClientError {
     Auth(#[from] AuthError),
     #[error("manifest not found for arch {0}")]
     ArchNotFound(String),
+    #[error("layer too large: {0} bytes")]
+    LayerTooLarge(u64),
     #[error("unexpected status {0}")]
     UnexpectedStatus(u16),
 }
@@ -95,7 +99,7 @@ impl RegistryClient {
         Ok(manifest)
     }
 
-    /// Télécharge un blob (layer) et retourne les bytes
+/// Télécharge un blob (layer) et retourne les bytes
     pub async fn pull_blob(
         &self,
         registry: &str,
@@ -115,6 +119,13 @@ impl RegistryClient {
             .bearer_auth(&token)
             .send()
             .await?;
+
+        // Vérifie la taille déclarée avant de télécharger
+        if let Some(content_length) = resp.content_length() {
+            if content_length > MAX_LAYER_SIZE {
+                return Err(ClientError::LayerTooLarge(content_length));
+            }
+        }
 
         match resp.status() {
             StatusCode::OK => Ok(resp.bytes().await?),

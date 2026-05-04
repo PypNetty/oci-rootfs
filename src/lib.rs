@@ -17,6 +17,8 @@ use registry::{
 };
 use store::{Store, StoreError};
 
+const MAX_ROOTFS_SIZE: u64 = 300 * 1024 * 1024; // 300 Mo
+
 #[derive(Debug, Error)]
 pub enum OciError {
     #[error("store error: {0}")]
@@ -29,9 +31,10 @@ pub enum OciError {
     Overlay(#[from] OverlayError),
     #[error("invalid image reference: {0}")]
     InvalidRef(String),
+    #[error("rootfs too large: {0} bytes, max 300MB")]
+    RootfsTooLarge(u64),
 }
 
-/// Résultat final — ce que Muscle consomme
 pub struct Rootfs {
     pub merged: PathBuf,
     pub socket: PathBuf,
@@ -58,12 +61,7 @@ impl Default for RootfsBuilder {
 
 impl RootfsBuilder {
     pub fn new() -> Self {
-        Self {
-            image: String::new(),
-            arch: Arch::Amd64,
-            name: String::new(),
-            credentials: None,
-        }
+        Self::default()
     }
 
     pub fn image(mut self, image: &str) -> Self {
@@ -101,6 +99,12 @@ impl RootfsBuilder {
             .pull_manifest(&registry, &repository, &tag, &self.arch)
             .await?;
 
+        // Vérifie la taille totale déclarée
+        let total_size: u64 = manifest.layers.iter().map(|l| l.size).sum();
+        if total_size > MAX_ROOTFS_SIZE {
+            return Err(OciError::RootfsTooLarge(total_size));
+        }
+
         // 4. Pull + cache chaque layer
         let mut lower_dirs: Vec<PathBuf> = Vec::new();
 
@@ -109,7 +113,6 @@ impl RootfsBuilder {
             let blob_path = store.blob_path(digest);
             let layer_dir = store.blob_path(&format!("{}-extracted", digest));
 
-            // Skip si déjà en cache
             if !layer_dir.exists() {
                 tracing::info!("pulling layer {}", &digest[..12]);
 
@@ -162,20 +165,16 @@ impl RootfsBuilder {
     }
 }
 
-/// Parse "debian:trixie-slim" ou "ghcr.io/owner/repo:tag"
 fn parse_image_ref(image: &str) -> Result<(String, String, String), OciError> {
     let (registry, rest) = if image.contains('/') {
         let first = image.split('/').next().unwrap();
         if first.contains('.') || first.contains(':') {
-            // registry explicite : ghcr.io/owner/repo:tag
             let rest = &image[first.len() + 1..];
             (first.to_string(), rest.to_string())
         } else {
-            // Docker Hub image avec namespace : owner/repo:tag
             ("registry-1.docker.io".to_string(), image.to_string())
         }
     } else {
-        // Docker Hub image officielle : debian:tag
         (
             "registry-1.docker.io".to_string(),
             format!("library/{}", image),
@@ -190,8 +189,6 @@ fn parse_image_ref(image: &str) -> Result<(String, String, String), OciError> {
 
     Ok((registry, repository, tag))
 }
-
-// src/lib.rs — à ajouter en bas
 
 #[cfg(test)]
 mod tests {
@@ -236,8 +233,4 @@ mod tests {
         let node_bin = rootfs.merged.join("usr/local/bin/node");
         println!("node exists: {}", node_bin.exists());
     }
-
-    
 }
-
-
