@@ -98,12 +98,12 @@ async fn main() {
         .allow_headers(Any);
 
     let app = Router::new()
-        .route("/api/vms",           get(get_vms))
-        .route("/api/vms/:name",     delete(delete_vm))
-        .route("/api/blobs",         get(get_blobs))
-        .route("/api/blobs/:digest", delete(delete_blob))
-        .route("/api/pull",          post(pull_image))
-        .route("/api/pulls",         get(get_pulls))
+        .route("/api/vms", get(get_vms))
+        .route("/api/vms/:name", delete(delete_vm))
+        .route("/api/blobs", get(get_blobs))
+        .route("/api/blobs/{digest}", delete(delete_blob))
+        .route("/api/pull", post(pull_image))
+        .route("/api/pulls", get(get_pulls))
         .nest_service("/", ServeDir::new("frontend/dist"))
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors)
@@ -130,9 +130,11 @@ async fn get_vms(State(state): State<AppState>) -> Json<Vec<VmInfo>> {
                 image: info["image"].as_str().unwrap_or("unknown").to_string(),
                 layers: info["layers"]
                     .as_array()
-                    .map(|l| l.iter()
-                        .filter_map(|v| v.as_str().map(|s| s[..12.min(s.len())].to_string()))
-                        .collect())
+                    .map(|l| {
+                        l.iter()
+                            .filter_map(|v| v.as_str().map(|s| s[..12.min(s.len())].to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 layers_downloaded: info["layers_downloaded"].as_u64().unwrap_or(0) as u32,
                 layers_cached: info["layers_cached"].as_u64().unwrap_or(0) as u32,
@@ -188,11 +190,14 @@ async fn pull_image(
 
     {
         let mut pulls = state.pulls.lock().await;
-        pulls.insert(name.clone(), PullStatus {
-            name: name.clone(),
-            status: "pulling".to_string(),
-            error: None,
-        });
+        pulls.insert(
+            name.clone(),
+            PullStatus {
+                name: name.clone(),
+                status: "pulling".to_string(),
+                error: None,
+            },
+        );
     }
 
     let pulls = state.pulls.clone();
@@ -205,12 +210,26 @@ async fn pull_image(
 
         let mut pulls = pulls.lock().await;
         match result {
-            Ok(_) => { pulls.insert(name.clone(), PullStatus {
-                name, status: "ready".to_string(), error: None,
-            }); }
-            Err(e) => { pulls.insert(name.clone(), PullStatus {
-                name, status: "error".to_string(), error: Some(e.to_string()),
-            }); }
+            Ok(_) => {
+                pulls.insert(
+                    name.clone(),
+                    PullStatus {
+                        name,
+                        status: "ready".to_string(),
+                        error: None,
+                    },
+                );
+            }
+            Err(e) => {
+                pulls.insert(
+                    name.clone(),
+                    PullStatus {
+                        name,
+                        status: "error".to_string(),
+                        error: Some(e.to_string()),
+                    },
+                );
+            }
         }
     });
 
