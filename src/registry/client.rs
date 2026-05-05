@@ -1,6 +1,7 @@
 // src/registry/client.rs
 
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
+use sha2::{Digest, Sha256};
 use std::time::Duration;
 use thiserror::Error;
 
@@ -22,6 +23,10 @@ pub enum ClientError {
     LayerTooLarge(u64),
     #[error("unexpected status {0}")]
     UnexpectedStatus(u16),
+    #[error("digest mismatch: expected {expected}, got {got}")]
+    DigestMismatch { expected: String, got: String },
+    #[error("json error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub struct RegistryClient {
@@ -89,7 +94,7 @@ impl RegistryClient {
             registry, repository, descriptor.digest
         );
 
-        let manifest: ImageManifest = self
+        let resp = self
             .client
             .get(&url)
             .bearer_auth(&token)
@@ -100,8 +105,20 @@ impl RegistryClient {
             )
             .send()
             .await?
-            .json()
-            .await?;
+            .error_for_status()?;
+
+        let body_bytes = resp.bytes().await?;
+        let manifest: ImageManifest = serde_json::from_slice(&body_bytes)?;
+
+        // Verify manifest digest
+        let manifest_digest = hex::encode(Sha256::digest(&body_bytes));
+        let expected_digest = descriptor.digest.trim_start_matches("sha256:");
+        if manifest_digest != expected_digest {
+            return Err(ClientError::DigestMismatch {
+                expected: expected_digest.to_string(),
+                got: manifest_digest,
+            });
+        }
 
         Ok(manifest)
     }
@@ -119,17 +136,19 @@ impl RegistryClient {
 
         let resp = self.client.get(&url).bearer_auth(&token).send().await?;
 
-        // Vérifie la taille déclarée avant de télécharger
-        if let Some(content_length) = resp.content_length()
-            && content_length > MAX_LAYER_SIZE
-        {
-            return Err(ClientError::LayerTooLarge(content_length));
+        let mut buf = Vec::with_capacity(MAX_LAYER_SIZE as usize);
+        let mut stream = resp.bytes_stream();
+
+        use futures_util::StreamExt;
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            if buf.len() + chunk.len() > MAX_LAYER_SIZE as usize {
+                return Err(ClientError::LayerTooLarge((buf.len() + chunk.len()) as u64));
+            }
+            buf.extend_from_slice(&chunk);
         }
 
-        match resp.status() {
-            StatusCode::OK => Ok(resp.bytes().await?),
-            s => Err(ClientError::UnexpectedStatus(s.as_u16())),
-        }
+        Ok(bytes::Bytes::from(buf))
     }
 
     async fn get_token(&self, registry: &str, repository: &str) -> Result<String, ClientError> {

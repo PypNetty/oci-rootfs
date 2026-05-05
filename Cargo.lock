@@ -759,6 +759,7 @@ dependencies = [
  "chrono",
  "dirs-next",
  "flate2",
+ "futures-util",
  "hex",
  "reqwest",
  "serde",
