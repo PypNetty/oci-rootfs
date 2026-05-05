@@ -32,6 +32,15 @@ pub struct OverlayMount {
     merged: std::path::PathBuf,
 }
 
+impl Drop for OverlayMount {
+    fn drop(&mut self) {
+        let merged = self.merged.to_string_lossy();
+        let _ = Command::new("fusermount3")
+            .args(["-u", merged.as_ref()])
+            .status();
+    }
+}
+
 fn find_virtiofsd() -> Option<&'static str> {
     let candidates = [
         "/usr/libexec/virtiofsd",
