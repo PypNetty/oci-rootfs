@@ -19,7 +19,10 @@ fn is_valid_digest(digest: &str) -> bool {
 }
 
 fn is_safe_name(name: &str) -> bool {
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
         && name.len() <= 128
 }
 
