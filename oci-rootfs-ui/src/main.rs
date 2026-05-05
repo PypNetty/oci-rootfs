@@ -1,7 +1,7 @@
 use axum::{
     Json, Router,
     extract::{Request, State},
-    http::{Method, StatusCode},
+    http::{Method, StatusCode, header},
     middleware::{self, Next},
     response::Response,
     routing::{delete, get, post},
@@ -9,7 +9,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc};
 use tokio::sync::Mutex;
-use tower_http::cors::{Any, CorsLayer};
+use subtle::ConstantTimeEq;
+use tower_http::cors::CorsLayer;
 use tower_http::services::ServeDir;
 use walkdir::WalkDir;
 
@@ -18,7 +19,10 @@ fn is_valid_digest(digest: &str) -> bool {
 }
 
 fn is_safe_name(name: &str) -> bool {
-    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    !name.is_empty()
+        && !name.starts_with('.')
+        && !name.contains("..")
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
         && name.len() <= 128
 }
 
@@ -83,7 +87,9 @@ async fn auth_middleware(request: Request, next: Next) -> Result<Response, Statu
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
-    if auth_header != format!("Bearer {}", token) {
+    let expected = format!("Bearer {}", token);
+    if auth_header.len() != expected.len() ||
+       auth_header.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
         return Err(StatusCode::UNAUTHORIZED);
     }
 
@@ -102,9 +108,9 @@ async fn main() {
     };
 
     let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse().unwrap())
+        .allow_origin("http://localhost:3000".parse::<axum::http::HeaderValue>().unwrap())
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
-        .allow_headers(Any);
+        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION]);
 
     let app = Router::new()
         .route("/api/vms", get(get_vms))
@@ -119,8 +125,19 @@ async fn main() {
         .layer(middleware::from_fn(auth_middleware))
         .layer(cors);
 
-    println!("oci-rootfs-ui → http://localhost:3000");
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    let token = std::env::var("KYERNAL_TOKEN").unwrap_or_default();
+    let bind_addr = std::env::var("KYERNAL_UI_BIND")
+        .unwrap_or_else(|_| "127.0.0.1:3000".to_string());
+
+    // Require token when binding to 0.0.0.0 or [::] (all interfaces)
+    let bind_requires_auth = bind_addr.starts_with("0.0.0.0") || bind_addr == "[::]";
+    if bind_requires_auth && token.is_empty() {
+        eprintln!("Error: KYERNAL_TOKEN must be set when binding to 0.0.0.0 or [::]");
+        std::process::exit(1);
+    }
+
+    println!("oci-rootfs-ui → http://{}", bind_addr);
+    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 

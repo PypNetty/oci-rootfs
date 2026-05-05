@@ -15,7 +15,7 @@ pub enum AuthError {
     Parse(String, String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Default)]
 pub struct Credentials {
     pub username: String,
     pub password: String,
