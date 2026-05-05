@@ -78,7 +78,11 @@ impl RootfsBuilder {
     }
 
     pub fn name(mut self, name: &str) -> Self {
-        self.name = name.to_string();
+        self.name = name
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+            .take(64)
+            .collect();
         self
     }
 
@@ -119,23 +123,31 @@ impl RootfsBuilder {
             let digest = layer.digest.trim_start_matches("sha256:");
             let blob_path = store.blob_path(digest);
             let layer_dir = store.blob_path(&format!("{}-extracted", digest));
+            let meta_path = store.blob_path(&format!("{}-meta.json", digest));
 
-            if !layer_dir.exists() {
+            let needs_download = !blob_path.exists();
+
+            if !layer_dir.exists() || !meta_path.exists() {
                 let layer_start = Instant::now();
 
-                let data = client
-                    .pull_blob(&registry, &repository, &layer.digest)
-                    .await?;
+                let data = if needs_download {
+                    tracing::debug!("downloading layer {}", &digest[..12]);
+                    let data = client
+                        .pull_blob(&registry, &repository, &layer.digest)
+                        .await?;
+                    bytes_downloaded += data.len() as u64;
+                    layers_downloaded += 1;
+                    verify_digest(&data, &layer.digest)?;
+                    save_blob(&data, &blob_path)?;
+                    data
+                } else {
+                    tracing::debug!("loading cached blob for extraction");
+                    bytes::Bytes::from(std::fs::read(&blob_path).map_err(UnpackError::Io)?)
+                };
 
-                let layer_duration_ms = layer_start.elapsed().as_millis() as u64;
-                bytes_downloaded += data.len() as u64;
-                layers_downloaded += 1;
-
-                verify_digest(&data, &layer.digest)?;
-                save_blob(&data, &blob_path)?;
                 extract_layer(&data, &layer_dir)?;
 
-                let meta_path = store.blob_path(&format!("{}-meta.json", digest));
+                let layer_duration_ms = layer_start.elapsed().as_millis() as u64;
                 save_blob_meta(
                     digest,
                     data.len() as u64,

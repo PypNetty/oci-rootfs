@@ -3,6 +3,7 @@
 use reqwest::Client;
 use serde::Deserialize;
 use thiserror::Error;
+use zeroize::Zeroize;
 
 #[derive(Debug, Error)]
 pub enum AuthError {
@@ -18,6 +19,13 @@ pub enum AuthError {
 pub struct Credentials {
     pub username: String,
     pub password: String,
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        self.username.zeroize();
+        self.password.zeroize();
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -3,6 +3,9 @@
 use chrono;
 use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use thiserror::Error;
 
@@ -27,6 +30,12 @@ pub fn verify_digest(data: &[u8], expected: &str) -> Result<(), UnpackError> {
 }
 
 pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
+    if dest.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+        return Err(UnpackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination is a symlink",
+        )));
+    }
     std::fs::create_dir_all(dest)?;
 
     let gz = GzDecoder::new(data);
@@ -37,6 +46,8 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     archive.set_overwrite(true);
     archive.set_unpack_xattrs(false);
     archive.set_preserve_ownerships(false);
+
+    tracing::debug!("extracting layer to {:?}", dest);
 
     for entry in archive.entries()? {
         let mut entry = entry?;
@@ -63,6 +74,28 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
             continue;
         }
 
+        if let tar::EntryType::Symlink | tar::EntryType::Link = entry.header().entry_type() {
+            if let Ok(Some(link_path)) = entry.link_name() {
+                let link_str = link_path.to_string_lossy();
+                if link_str.contains("..") {
+                    tracing::warn!("unsafe symlink skipped: {:?} -> {:?}", path, link_str);
+                    continue;
+                }
+            }
+        }
+
+        if entry.header().entry_type().is_dir() {
+            std::fs::create_dir_all(&target)?;
+            continue;
+        }
+
+        if let Some(parent) = target.parent() {
+            if !parent.exists() {
+                tracing::debug!("creating parent dir: {:?}", parent);
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+
         if entry.header().entry_type().is_hard_link() {
             if let Err(e) = entry.unpack(&target) {
                 tracing::debug!("hard link skipped: {:?} — {}", path, e);
@@ -70,7 +103,6 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
             continue;
         }
 
-        // Supprime le fichier existant si conflit de type
         if target.exists() {
             if target.is_dir() {
                 let _ = std::fs::remove_dir_all(&target);
@@ -80,6 +112,13 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
         }
 
         entry.unpack(&target)?;
+
+        if let Ok(metadata) = fs::metadata(&target) {
+            let mode = metadata.mode();
+            if mode & 0o4000 != 0 || mode & 0o2000 != 0 {
+                let _ = fs::set_permissions(&target, fs::Permissions::from_mode(mode & !0o7111));
+            }
+        }
     }
 
     Ok(())
@@ -89,7 +128,27 @@ pub fn save_blob(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(dest, data)?;
+    if dest.symlink_metadata().map_or(false, |m| m.file_type().is_symlink()) {
+        return Err(UnpackError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "destination is a symlink",
+        )));
+    }
+    if dest.exists() {
+        let existing = std::fs::read(dest)?;
+        if existing == data {
+            return Ok(());
+        }
+        std::fs::write(dest, data)?;
+    } else {
+        let file = fs::File::options()
+            .create_new(true)
+            .write(true)
+            .open(dest)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(data)?;
+        writer.flush()?;
+    }
     Ok(())
 }
 
@@ -115,6 +174,8 @@ pub fn save_blob_meta(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(dest, meta.to_string())?;
+    let tmp = dest.with_extension("tmp");
+    std::fs::write(&tmp, meta.to_string())?;
+    std::fs::rename(tmp, dest)?;
     Ok(())
 }

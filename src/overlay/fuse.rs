@@ -22,8 +22,9 @@ pub struct OverlayMount {
 
 impl Drop for OverlayMount {
     fn drop(&mut self) {
+        let merged = self.merged.to_string_lossy().into_owned();
         let _ = Command::new("fusermount3")
-            .args(["-u", self.merged.to_str().unwrap()])
+            .args(["-u", &merged])
             .status();
     }
 }
@@ -87,6 +88,12 @@ pub fn spawn_virtiofsd(
             shared_dir.to_str().unwrap(),
             "--cache",
             "auto",
+            "--sandbox",
+            "namespace",
+            "--thread-pool-size",
+            "1",
+            "--flock",
+            "--no-allow-foreign-sync",
         ])
         .spawn()?;
 
