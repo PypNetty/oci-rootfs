@@ -99,7 +99,7 @@ impl RegistryClient {
         Ok(manifest)
     }
 
-/// Télécharge un blob (layer) et retourne les bytes
+    /// Télécharge un blob (layer) et retourne les bytes
     pub async fn pull_blob(
         &self,
         registry: &str,
@@ -108,17 +108,9 @@ impl RegistryClient {
     ) -> Result<bytes::Bytes, ClientError> {
         let token = self.get_token(registry, repository).await?;
 
-        let url = format!(
-            "https://{}/v2/{}/blobs/{}",
-            registry, repository, digest
-        );
+        let url = format!("https://{}/v2/{}/blobs/{}", registry, repository, digest);
 
-        let resp = self
-            .client
-            .get(&url)
-            .bearer_auth(&token)
-            .send()
-            .await?;
+        let resp = self.client.get(&url).bearer_auth(&token).send().await?;
 
         // Vérifie la taille déclarée avant de télécharger
         if let Some(content_length) = resp.content_length() {
@@ -133,37 +125,48 @@ impl RegistryClient {
         }
     }
 
-    async fn get_token(
-        &self,
-        registry: &str,
-        repository: &str,
-    ) -> Result<String, ClientError> {
+    async fn get_token(&self, registry: &str, repository: &str) -> Result<String, ClientError> {
         let scope = format!("repository:{}:pull", repository);
 
-        // Docker Hub a un realm spécifique
-        let (realm, service) = if registry.contains("docker.io") {
-            (
-                "https://auth.docker.io/token".to_string(),
-                "registry.docker.io".to_string(),
+        if registry.contains("docker.io") {
+            let token = auth::fetch_token(
+                &self.client,
+                "https://auth.docker.io/token",
+                "registry.docker.io",
+                &scope,
+                self.credentials.as_ref(),
             )
-        } else {
-            // Pour les autres registries on fait une requête anonyme
-            // et on parse le WWW-Authenticate si 401
-            (
-                format!("https://{}/token", registry),
-                registry.to_string(),
+            .await?;
+            return Ok(token);
+        }
+
+        // Découvre le realm via WWW-Authenticate
+        if let Some((realm, service)) = self.discover_auth(registry).await {
+            let token = auth::fetch_token(
+                &self.client,
+                &realm,
+                &service,
+                &scope,
+                self.credentials.as_ref(),
             )
-        };
+            .await?;
+            return Ok(token);
+        }
 
-        let token = auth::fetch_token(
-            &self.client,
-            &realm,
-            &service,
-            &scope,
-            self.credentials.as_ref(),
-        )
-        .await?;
+        // Pas d'auth requis — registry public sans token
+        Ok(String::new())
+    }
 
-        Ok(token)
+    async fn discover_auth(&self, registry: &str) -> Option<(String, String)> {
+        let url = format!("https://{}/v2/", registry);
+        let resp = self.client.get(&url).send().await.ok()?;
+
+        let www_auth = resp
+            .headers()
+            .get("www-authenticate")
+            .and_then(|v| v.to_str().ok())?
+            .to_string();
+
+        auth::parse_www_authenticate(&www_auth)
     }
 }
