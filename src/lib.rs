@@ -171,8 +171,7 @@ impl RootfsBuilder {
         std::fs::write(vm_dir.base.join("manifest.json"), meta.to_string())
             .map_err(StoreError::Io)?;
 
-        let lower_refs: Vec<&std::path::Path> =
-            lower_dirs.iter().map(|p| p.as_path()).collect();
+        let lower_refs: Vec<&std::path::Path> = lower_dirs.iter().map(|p| p.as_path()).collect();
 
         let overlay = mount_overlay(
             &lower_refs,
@@ -259,5 +258,29 @@ mod tests {
 
         let node_bin = rootfs.merged.join("usr/local/bin/node");
         println!("node exists: {}", node_bin.exists());
+    }
+}
+
+#[tokio::test]
+#[ignore]
+async fn test_pull_registries() {
+    let images_env = std::env::var("KYERNAL_TEST_IMAGES").unwrap_or_default();
+
+    let images: Vec<&str> = images_env.split(',').filter(|s| !s.is_empty()).collect();
+
+    if images.is_empty() {
+        println!("set KYERNAL_TEST_IMAGES=image1:tag,image2:tag to test");
+        return;
+    }
+
+    for image in images {
+        let name = image.replace(['/', ':', '.'], "-");
+        println!("\n--- testing {} ---", image);
+        let result = RootfsBuilder::new().image(image).name(&name).build().await;
+
+        match result {
+            Ok(rootfs) => println!("✓ {} → {}", image, rootfs.merged.exists()),
+            Err(e) => println!("✗ {} → {}", image, e),
+        }
     }
 }

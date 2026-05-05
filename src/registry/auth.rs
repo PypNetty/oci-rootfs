@@ -10,9 +10,10 @@ pub enum AuthError {
     Http(#[from] reqwest::Error),
     #[error("no token in response")]
     NoToken,
+    #[error("parse error: {0} — body: {1}")]
+    Parse(String, String),
 }
 
-/// Credentials optionnelles pour registries privés
 #[derive(Debug, Clone)]
 pub struct Credentials {
     pub username: String,
@@ -21,12 +22,12 @@ pub struct Credentials {
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
+    #[serde(default)]
     token: Option<String>,
+    #[serde(default)]
     access_token: Option<String>,
 }
 
-/// Récupère un token Bearer pour un registry/repo donné
-/// Gère Docker Hub, ghcr.io, quay.io — tous suivent le même flow WWW-Authenticate
 pub async fn fetch_token(
     client: &Client,
     realm: &str,
@@ -42,15 +43,21 @@ pub async fn fetch_token(
         req = req.basic_auth(&creds.username, Some(&creds.password));
     }
 
-    let resp: TokenResponse = req.send().await?.json().await?;
+    let resp = req.send().await?;
+    let status = resp.status();
+    let text = resp.text().await.map_err(|e| {
+        AuthError::Parse(format!("status={} text_error={}", status, e), String::new())
+    })?;
 
-    resp.token
-        .or(resp.access_token)
+    let parsed: TokenResponse =
+        serde_json::from_str(&text).map_err(|e| AuthError::Parse(e.to_string(), text.clone()))?;
+
+    parsed
+        .token
+        .or(parsed.access_token)
         .ok_or(AuthError::NoToken)
 }
 
-/// Parse le header WWW-Authenticate pour extraire realm, service, scope
-/// Exemple : Bearer realm="https://auth.docker.io/token",service="registry.docker.io"
 pub fn parse_www_authenticate(header: &str) -> Option<(String, String)> {
     let realm = extract_value(header, "realm")?;
     let service = extract_value(header, "service").unwrap_or_default();
