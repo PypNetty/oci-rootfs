@@ -70,6 +70,15 @@ pub fn extract_layer(data: &[u8], dest: &Path) -> Result<(), UnpackError> {
             continue;
         }
 
+        // Supprime le fichier existant si conflit de type
+        if target.exists() {
+            if target.is_dir() {
+                let _ = std::fs::remove_dir_all(&target);
+            } else {
+                let _ = std::fs::remove_file(&target);
+            }
+        }
+
         entry.unpack(&target)?;
     }
 
