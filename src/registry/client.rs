@@ -1,9 +1,11 @@
 // src/registry/client.rs
 
 use reqwest::{Client, StatusCode};
+use std::time::Duration;
 use thiserror::Error;
 
 const MAX_LAYER_SIZE: u64 = 100 * 1024 * 1024; // 100 Mo
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::registry::auth::{self, AuthError, Credentials};
 use crate::registry::manifest::{Arch, ImageIndex, ImageManifest};
@@ -29,8 +31,13 @@ pub struct RegistryClient {
 
 impl RegistryClient {
     pub fn new(credentials: Option<Credentials>) -> Self {
+        let client = Client::builder()
+            .timeout(HTTP_TIMEOUT)
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| Client::new());
         Self {
-            client: Client::new(),
+            client,
             credentials,
         }
     }
@@ -113,10 +120,10 @@ impl RegistryClient {
         let resp = self.client.get(&url).bearer_auth(&token).send().await?;
 
         // Vérifie la taille déclarée avant de télécharger
-        if let Some(content_length) = resp.content_length() {
-            if content_length > MAX_LAYER_SIZE {
-                return Err(ClientError::LayerTooLarge(content_length));
-            }
+        if let Some(content_length) = resp.content_length()
+            && content_length > MAX_LAYER_SIZE
+        {
+            return Err(ClientError::LayerTooLarge(content_length));
         }
 
         match resp.status() {

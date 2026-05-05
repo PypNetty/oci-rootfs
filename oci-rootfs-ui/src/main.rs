@@ -13,6 +13,15 @@ use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use walkdir::WalkDir;
 
+fn is_valid_digest(digest: &str) -> bool {
+    digest.len() == 64 && digest.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn is_safe_name(name: &str) -> bool {
+    name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+        && name.len() <= 128
+}
+
 #[derive(Clone)]
 struct AppState {
     store_root: PathBuf,
@@ -93,7 +102,7 @@ async fn main() {
     };
 
     let cors = CorsLayer::new()
-        .allow_origin(Any)
+        .allow_origin("http://localhost:3000".parse().unwrap())
         .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers(Any);
 
@@ -186,6 +195,10 @@ async fn pull_image(
     State(state): State<AppState>,
     Json(req): Json<PullRequest>,
 ) -> Json<serde_json::Value> {
+    if !is_safe_name(&req.name) {
+        return Json(serde_json::json!({ "error": "invalid name" }));
+    }
+
     let name = req.name.clone();
     let image = req.image.clone();
 
@@ -246,6 +259,10 @@ async fn delete_vm(
     State(state): State<AppState>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, StatusCode> {
+    if !is_safe_name(&name) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let vm_path = state.store_root.join("vms").join(&name);
     if !vm_path.exists() {
         return Err(StatusCode::NOT_FOUND);
@@ -253,7 +270,7 @@ async fn delete_vm(
 
     let merged = vm_path.join("merged");
     let _ = std::process::Command::new("fusermount3")
-        .args(["-u", merged.to_str().unwrap()])
+        .args(["-u", merged.to_str().unwrap_or("")])
         .status();
 
     std::fs::remove_dir_all(&vm_path).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
@@ -265,8 +282,15 @@ async fn delete_blob(
     State(state): State<AppState>,
     digest: axum::extract::Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    // Strip sha256: prefix if present
-    let digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    let digest = if digest.starts_with("sha256:") {
+        &digest[7..]
+    } else {
+        &digest
+    };
+
+    if !is_valid_digest(digest) {
+        return Err((StatusCode::BAD_REQUEST, "invalid digest format".to_string()));
+    }
 
     let blobs_dir = state.store_root.join("blobs/sha256");
     let blob = blobs_dir.join(digest);
